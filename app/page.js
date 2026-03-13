@@ -45,6 +45,8 @@ export default function McGift() {
   const [upStatus, setUpStatus] = useState(null);
   const [syncMsg, setSyncMsg] = useState(null);
   const [showArch, setShowArch] = useState(false);
+  const [authed, setAuthed] = useState(false);
+  const [pw, setPw] = useState("");
 
   const load = useCallback(async () => {
     const res = await fetch("/api/data");
@@ -87,6 +89,20 @@ export default function McGift() {
   }, [data, save]);
 
   if (loading) return <div className="min-h-screen flex items-center justify-center"><p className="text-brand-muted">Loading…</p></div>;
+
+  if (!authed) return (
+    <div className="min-h-screen flex items-center justify-center px-6">
+      <div className="fade-up w-full max-w-xs text-center">
+        <h1 className="font-display text-[28px] font-extrabold mb-1">McGift</h1>
+        <p className="text-brand-muted text-sm mb-6">Enter the family password</p>
+        <input type="password" value={pw} onChange={e=>setPw(e.target.value)} placeholder="Password"
+          className="w-full px-3.5 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white text-brand-text focus:border-brand-accent transition-colors mb-3 text-center"
+          onKeyDown={async e=>{if(e.key==="Enter"){const r=await fetch("/api/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});const d=await r.json();if(d.ok)setAuthed(true);else{setPw("");alert("Wrong password")}}}} />
+        <button onClick={async()=>{const r=await fetch("/api/auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});const d=await r.json();if(d.ok)setAuthed(true);else{setPw("");alert("Wrong password")}}}
+          className="w-full bg-brand-accent text-white font-semibold rounded-lg py-2.5 text-sm cursor-pointer border-none">Enter</button>
+      </div>
+    </div>
+  );
 
   const active = data.gifts.filter(g => g.status === "active");
   const complete = data.gifts.filter(g => g.status === "complete");
