@@ -4,18 +4,21 @@ import { useState, useEffect, useCallback } from "react";
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
+function nameInitials(name) {
+  return (name || "").split(/[\/&]|and/i).map(s => s.trim()).filter(Boolean).map(s => s[0].toUpperCase()).join("");
+}
+
 function genRef(recipient, title, contributor) {
-  const clean = s => (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
-  const shortTitle = (title || "").toUpperCase().replace(/[^A-Z0-9 ]/g, "").split(" ").map(w => w.slice(0, 4)).join("").slice(0, 6);
+  const recip3 = (recipient || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
   const yr = new Date().getFullYear().toString().slice(2);
-  return [clean(recipient), shortTitle, yr, clean(contributor)].filter(Boolean).join("-");
+  const conInit = nameInitials(contributor);
+  return [recip3, yr, conInit].filter(Boolean).join("-");
 }
 
 function giftRefCode(recipient, title) {
-  const clean = s => (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
-  const shortTitle = (title || "").toUpperCase().replace(/[^A-Z0-9 ]/g, "").split(" ").map(w => w.slice(0, 4)).join("").slice(0, 6);
+  const recip3 = (recipient || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
   const yr = new Date().getFullYear().toString().slice(2);
-  return [clean(recipient), shortTitle, yr].filter(Boolean).join("-");
+  return [recip3, yr].filter(Boolean).join("-");
 }
 
 function fmtDate(iso) { return iso ? new Date(iso).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric" }) : ""; }
