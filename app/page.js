@@ -196,12 +196,12 @@ export default function McGift() {
           ) : (
             <div className="flex gap-3 mb-5 flex-wrap">
               <div className="p-3 px-4 bg-brand-accent-light rounded-lg flex-1 min-w-[100px]">
-                <div className="text-[22px] font-bold font-display text-brand-accent">{active.filter(g=>g.contributions.some(c=>c.memberId===myMemberId)).length}</div>
-                <div className="text-xs text-brand-accent font-medium">Your Active Gifts</div>
+                <div className="text-[22px] font-bold font-display text-brand-accent">{active.length}</div>
+                <div className="text-xs text-brand-accent font-medium">Active Gifts</div>
               </div>
               <div className="p-3 px-4 bg-brand-green-light rounded-lg flex-1 min-w-[100px]">
                 <div className="text-[22px] font-bold font-display text-brand-green">{data.gifts.filter(g=>g.contributions.some(c=>c.memberId===myMemberId&&c.paid)).length}</div>
-                <div className="text-xs text-brand-green font-medium">Paid</div>
+                <div className="text-xs text-brand-green font-medium">You've Paid</div>
               </div>
               <div className="p-3 px-4 bg-[#F0ECE4] rounded-lg flex-1 min-w-[100px]">
                 <div className="text-[22px] font-bold font-display text-brand-muted">
@@ -218,8 +218,6 @@ export default function McGift() {
 
           {live.map((g,i)=>{
             const myContrib = g.contributions.find(c => c.memberId === myMemberId);
-            // Family members only see gifts they're part of
-            if (!isAdmin && !myContrib) return null;
             const dl = daysLeft(g.deadline);
             const gRef = giftRefCode(g.recipient, g.title);
 
@@ -239,36 +237,16 @@ export default function McGift() {
               </Crd>;
             }
 
-            // Family view — only shows their own details
-            return <Crd key={g.id} className="fade-up mb-3" style={{animationDelay:`${i*0.05}s`}}>
-              <div className="flex justify-between items-start mb-2">
-                <div><h3 className="font-display text-lg font-bold mb-0.5">{g.title}</h3><p className="text-[13px] text-brand-muted">For {g.recipient}{g.deadline&&<span> · Due {fmtDate(g.deadline)}</span>}</p></div>
-                <div className="flex gap-1.5 flex-wrap justify-end">
-                  {dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}
-                  {dl!==null&&dl<=0&&<Bdg v="warning">Overdue</Bdg>}
-                  {myContrib.paid ? <Bdg v="success">Paid ✓</Bdg> : <Bdg v="default">Pending</Bdg>}
-                </div>
-              </div>
-              {g.description&&<p className="text-sm text-brand-muted mb-3">{g.description}</p>}
-              {!myContrib.paid && (
-                <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
-                    <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
-                  </div>
-                  {process.env.NEXT_PUBLIC_ACCOUNT_NAME&&<div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_ACCOUNT_NAME}</div>}
-                  {process.env.NEXT_PUBLIC_BSB&&<div className="text-sm text-brand-muted">BSB: {process.env.NEXT_PUBLIC_BSB}</div>}
-                  {process.env.NEXT_PUBLIC_ACCOUNT&&<div className="text-sm text-brand-muted">Account: {process.env.NEXT_PUBLIC_ACCOUNT}</div>}
-                  <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
-                  <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
-                </div>
-              )}
-              {myContrib.paid && (
-                <div className="p-3 px-4 bg-brand-green-light rounded-lg text-center">
-                  <span className="text-sm font-semibold text-brand-green">You've paid ${myContrib.amount.toFixed(0)} ✓</span>
-                </div>
-              )}
-            </Crd>;
+            // Family view — shows all active gifts, with opt-in or their own details
+            return <FamilyGiftCard key={g.id} gift={g} myContrib={myContrib} myMemberId={myMemberId} myName={myName} dl={dl}
+              onOptIn={(amount) => {
+                const ref = genRef(g.recipient, g.title, myName);
+                const newC = {id:genId(), memberId:myMemberId, amount, paid:false, paidAt:null, refCode:ref};
+                const newGifts = data.gifts.map(x => x.id===g.id ? {...x, contributions:[...x.contributions, newC]} : x);
+                save({...data, gifts:newGifts});
+              }}
+              i={i}
+            />;
           })}
 
           {/* Admin: archived section */}
@@ -452,4 +430,69 @@ function WishTab({ wishlists, onSave }) {
         <button onClick={()=>setAddTo(n)} className="mt-2 text-[13px] text-brand-accent font-semibold cursor-pointer py-1 bg-transparent border-none">+ Add another idea</button>}
     </Crd>})}
   </div>;
+}
+
+// ─── Family Gift Card (contributor view) ───
+function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, i }) {
+  const [showOptIn, setShowOptIn] = useState(false);
+  const [optAmt, setOptAmt] = useState("");
+
+  // Don't show gifts where this person is the recipient
+  if (gift.recipient.toLowerCase() === myName.toLowerCase()) return null;
+
+  return <Crd className="fade-up mb-3" style={{animationDelay:`${i*0.05}s`}}>
+    <div className="flex justify-between items-start mb-2">
+      <div>
+        <h3 className="font-display text-lg font-bold mb-0.5">{gift.title}</h3>
+        <p className="text-[13px] text-brand-muted">For {gift.recipient}{gift.deadline&&<span> · Due {fmtDate(gift.deadline)}</span>}</p>
+      </div>
+      <div className="flex gap-1.5 flex-wrap justify-end">
+        {dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}
+        {dl!==null&&dl<=0&&gift.status==="active"&&<Bdg v="warning">Overdue</Bdg>}
+        {myContrib ? (myContrib.paid ? <Bdg v="success">Paid ✓</Bdg> : <Bdg v="default">Pending</Bdg>) : <Bdg v="muted">Not joined</Bdg>}
+      </div>
+    </div>
+    {gift.description&&<p className="text-sm text-brand-muted mb-3">{gift.description}</p>}
+
+    {/* Not yet opted in */}
+    {!myContrib && gift.status === "active" && (
+      showOptIn ? (
+        <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
+          <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">How much will you contribute?</label>
+          <div className="flex gap-2 items-end">
+            <div className="flex-1">
+              <input type="number" placeholder="$0" value={optAmt} onChange={e=>setOptAmt(e.target.value)}
+                className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
+            </div>
+            <Btn onClick={()=>{if(optAmt&&parseFloat(optAmt)>0){onOptIn(parseFloat(optAmt));setShowOptIn(false);setOptAmt("")}}} disabled={!optAmt||parseFloat(optAmt)<=0}>Confirm</Btn>
+            <Btn v="ghost" onClick={()=>{setShowOptIn(false);setOptAmt("")}}>Cancel</Btn>
+          </div>
+        </div>
+      ) : (
+        <Btn v="secondary" onClick={()=>setShowOptIn(true)}>I'm in!</Btn>
+      )
+    )}
+
+    {/* Opted in but not paid */}
+    {myContrib && !myContrib.paid && (
+      <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
+        <div className="flex justify-between items-center mb-2">
+          <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
+          <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
+        </div>
+        {process.env.NEXT_PUBLIC_ACCOUNT_NAME&&<div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_ACCOUNT_NAME}</div>}
+        {process.env.NEXT_PUBLIC_BSB&&<div className="text-sm text-brand-muted">BSB: {process.env.NEXT_PUBLIC_BSB}</div>}
+        {process.env.NEXT_PUBLIC_ACCOUNT&&<div className="text-sm text-brand-muted">Account: {process.env.NEXT_PUBLIC_ACCOUNT}</div>}
+        <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
+        <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
+      </div>
+    )}
+
+    {/* Paid */}
+    {myContrib && myContrib.paid && (
+      <div className="p-3 px-4 bg-brand-green-light rounded-lg text-center">
+        <span className="text-sm font-semibold text-brand-green">You've paid ${myContrib.amount.toFixed(0)} ✓</span>
+      </div>
+    )}
+  </Crd>;
 }
