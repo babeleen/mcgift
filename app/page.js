@@ -388,7 +388,7 @@ function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
       <div className="p-2.5 px-4 bg-[#F0ECE4] rounded-lg flex-1"><div className="text-lg font-bold font-display text-brand-muted">${tp.toFixed(0)}</div><div className="text-[11px] text-brand-muted">Pledged</div></div>
     </div>
     <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg mb-5">
-      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">Pay To</div>
+      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">Pay ID</div>
       {process.env.NEXT_PUBLIC_PAYID&&<div className="text-sm font-semibold mt-1">{process.env.NEXT_PUBLIC_PAYID}</div>}
       <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-1">Reference Codes</div>
       {cs.map(c => {
@@ -511,7 +511,7 @@ function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, onEd
               <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
               <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
             </div>
-            {process.env.NEXT_PUBLIC_PAYID&&<><div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Pay To</div><div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_PAYID}</div></>}
+            {process.env.NEXT_PUBLIC_PAYID&&<><div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Pay ID</div><div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_PAYID}</div></>}
             <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
             <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
             <div className="flex gap-3 mt-3 pt-3 border-t border-brand-border">
