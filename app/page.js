@@ -248,6 +248,20 @@ export default function McGift() {
                 const newGifts = data.gifts.map(x => x.id===g.id ? {...x, contributions:[...x.contributions, newC]} : x);
                 save({...data, gifts:newGifts});
               }}
+              onEdit={(newAmount) => {
+                const newGifts = data.gifts.map(x => {
+                  if (x.id !== g.id) return x;
+                  return {...x, contributions: x.contributions.map(c => c.memberId === myMemberId ? {...c, amount: newAmount} : c)};
+                });
+                save({...data, gifts:newGifts});
+              }}
+              onWithdraw={() => {
+                const newGifts = data.gifts.map(x => {
+                  if (x.id !== g.id) return x;
+                  return {...x, contributions: x.contributions.filter(c => c.memberId !== myMemberId)};
+                });
+                save({...data, gifts:newGifts});
+              }}
               i={i}
             />;
           })}
@@ -375,9 +389,7 @@ function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
     </div>
     <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg mb-5">
       <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">Pay To</div>
-      {process.env.NEXT_PUBLIC_ACCOUNT_NAME&&<div className="text-sm font-semibold mt-1">{process.env.NEXT_PUBLIC_ACCOUNT_NAME}</div>}
-      {process.env.NEXT_PUBLIC_BSB&&<div className="text-sm text-brand-muted">BSB: {process.env.NEXT_PUBLIC_BSB}</div>}
-      {process.env.NEXT_PUBLIC_ACCOUNT&&<div className="text-sm text-brand-muted">Account: {process.env.NEXT_PUBLIC_ACCOUNT}</div>}
+      {process.env.NEXT_PUBLIC_PAYID&&<div className="text-sm font-semibold mt-1">{process.env.NEXT_PUBLIC_PAYID}</div>}
       <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-1">Reference Codes</div>
       {cs.map(c => {
         const m = members.find(x => x.id === c.memberId);
@@ -436,9 +448,11 @@ function WishTab({ wishlists, onSave }) {
 }
 
 // ─── Family Gift Card (contributor view) ───
-function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, i }) {
+function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, onEdit, onWithdraw, i }) {
   const [showOptIn, setShowOptIn] = useState(false);
   const [optAmt, setOptAmt] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editAmt, setEditAmt] = useState("");
 
   // Don't show gifts where this person is the recipient
   if (gift.recipient.toLowerCase() === myName.toLowerCase()) return null;
@@ -479,15 +493,33 @@ function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, i })
     {/* Opted in but not paid */}
     {myContrib && !myContrib.paid && (
       <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
-        <div className="flex justify-between items-center mb-2">
-          <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
-          <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
-        </div>
-        {process.env.NEXT_PUBLIC_ACCOUNT_NAME&&<div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_ACCOUNT_NAME}</div>}
-        {process.env.NEXT_PUBLIC_BSB&&<div className="text-sm text-brand-muted">BSB: {process.env.NEXT_PUBLIC_BSB}</div>}
-        {process.env.NEXT_PUBLIC_ACCOUNT&&<div className="text-sm text-brand-muted">Account: {process.env.NEXT_PUBLIC_ACCOUNT}</div>}
-        <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
-        <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
+        {editing ? (
+          <>
+            <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">Update your amount</label>
+            <div className="flex gap-2 items-end mb-3">
+              <div className="flex-1">
+                <input type="number" placeholder="$0" value={editAmt} onChange={e=>setEditAmt(e.target.value)}
+                  className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
+              </div>
+              <Btn onClick={()=>{if(editAmt&&parseFloat(editAmt)>0){onEdit(parseFloat(editAmt));setEditing(false);setEditAmt("")}}} disabled={!editAmt||parseFloat(editAmt)<=0}>Save</Btn>
+              <Btn v="ghost" onClick={()=>{setEditing(false);setEditAmt("")}}>Cancel</Btn>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
+              <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
+            </div>
+            {process.env.NEXT_PUBLIC_PAYID&&<><div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Pay To</div><div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_PAYID}</div></>}
+            <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
+            <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
+            <div className="flex gap-3 mt-3 pt-3 border-t border-brand-border">
+              <button onClick={()=>{setEditing(true);setEditAmt(myContrib.amount.toString())}} className="text-xs text-brand-accent font-semibold cursor-pointer bg-transparent border-none">Change amount</button>
+              <button onClick={()=>{if(confirm("Withdraw from this gift?"))onWithdraw()}} className="text-xs text-brand-muted cursor-pointer bg-transparent border-none">Withdraw</button>
+            </div>
+          </>
+        )}
       </div>
     )}
 
