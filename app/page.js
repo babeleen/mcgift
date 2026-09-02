@@ -8,17 +8,22 @@ function nameInitials(name) {
   return (name || "").split(/[\/&]|and/i).map(s => s.trim()).filter(Boolean).map(s => s[0].toUpperCase()).join("");
 }
 
-function genRef(recipient, title, contributor) {
+// Standalone gift (no round) ref code — RECIPIENT3-YEAR-INITIALS
+function genRef(recipient, contributor) {
   const recip3 = (recipient || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
   const yr = new Date().getFullYear().toString().slice(2);
-  const conInit = nameInitials(contributor);
-  return [recip3, yr, conInit].filter(Boolean).join("-");
+  return [recip3, yr, nameInitials(contributor)].filter(Boolean).join("-");
 }
 
-function giftRefCode(recipient, title) {
+function giftRefCode(recipient) {
   const recip3 = (recipient || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
   const yr = new Date().getFullYear().toString().slice(2);
   return [recip3, yr].filter(Boolean).join("-");
+}
+
+// Round-level ref code per person — ROUNDCODE-INITIALS (same across every gift in that round)
+function roundPersonRef(round, contributor) {
+  return [round.refCode, nameInitials(contributor)].filter(Boolean).join("-");
 }
 
 function fmtDate(iso) { return iso ? new Date(iso).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric" }) : ""; }
@@ -58,12 +63,13 @@ export default function McGift() {
   const [view, setView] = useState("gifts");
   const [showNewGift, setShowNewGift] = useState(false);
   const [showNewMember, setShowNewMember] = useState(false);
+  const [showNewRound, setShowNewRound] = useState(false);
   const [selGift, setSelGift] = useState(null);
   const [upStatus, setUpStatus] = useState(null);
   const [syncMsg, setSyncMsg] = useState(null);
   const [showArch, setShowArch] = useState(false);
   const [authed, setAuthed] = useState(false);
-  const [role, setRole] = useState(null); // "admin" or "family"
+  const [role, setRole] = useState(null);
   const [myName, setMyName] = useState("");
   const [nameConfirmed, setNameConfirmed] = useState(false);
   const [pw, setPw] = useState("");
@@ -72,7 +78,10 @@ export default function McGift() {
 
   const load = useCallback(async () => {
     const res = await fetch("/api/data");
-    setData(await res.json());
+    const d = await res.json();
+    if (!d.rounds) d.rounds = [];
+    if (!d.reviewQueue) d.reviewQueue = [];
+    setData(d);
     setLoading(false);
   }, []);
 
@@ -83,20 +92,26 @@ export default function McGift() {
 
   useEffect(() => { load(); }, [load]);
 
+  // ─── Sync: aggregate by round+person, match against round ref code, flag mismatches ───
   const sync = useCallback(async () => {
     setSyncMsg("Checking Up Bank…");
     try {
       const res = await fetch("/api/up/transactions");
       const { transactions } = await res.json();
       if (!transactions?.length) { setSyncMsg("No new payments detected"); setTimeout(() => setSyncMsg(null), 3000); return; }
+
       let updated = false;
-      const newGifts = data.gifts.map(g => {
-        if (g.status !== "active") return g;
+      let newGifts = [...data.gifts];
+      let newReviewQueue = [...(data.reviewQueue || [])];
+
+      // Standalone gifts (no round) — match per-contribution as before
+      newGifts = newGifts.map(g => {
+        if (g.status !== "active" || g.roundId) return g;
         const newC = g.contributions.map(c => {
           if (c.paid) return c;
           const match = transactions.find(t => {
             const d = (t.attributes.description + " " + (t.attributes.message || "")).toUpperCase();
-            return (d.includes(c.refCode) || d.includes(g.refCode || "NOMATCH")) && parseFloat(t.attributes.amount.value) >= c.amount;
+            return d.includes(c.refCode) && parseFloat(t.attributes.amount.value) >= c.amount;
           });
           if (match) { updated = true; return { ...c, paid: true, paidAt: match.attributes.createdAt }; }
           return c;
@@ -104,18 +119,67 @@ export default function McGift() {
         const allPaid = newC.length > 0 && newC.every(c => c.paid);
         return { ...g, contributions: newC, status: allPaid ? "complete" : g.status };
       });
-      await save({ ...data, gifts: newGifts });
+
+      // Round-based gifts — aggregate per person per round
+      for (const round of data.rounds) {
+        if (round.status !== "open") continue;
+        const roundGiftIds = newGifts.filter(g => g.roundId === round.id && g.status === "active").map(g => g.id);
+        if (roundGiftIds.length === 0) continue;
+
+        const peopleInRound = new Set();
+        newGifts.filter(g => roundGiftIds.includes(g.id)).forEach(g => g.contributions.forEach(c => peopleInRound.add(c.memberId)));
+
+        for (const memberId of peopleInRound) {
+          const member = data.members.find(m => m.id === memberId);
+          if (!member) continue;
+          const ref = roundPersonRef(round, member.name);
+
+          const owedTotal = newGifts
+            .filter(g => roundGiftIds.includes(g.id))
+            .reduce((sum, g) => sum + g.contributions.filter(c => c.memberId === memberId && !c.paid).reduce((s, c) => s + c.amount, 0), 0);
+
+          if (owedTotal <= 0) continue;
+
+          const match = transactions.find(t => {
+            const d = (t.attributes.description + " " + (t.attributes.message || "")).toUpperCase();
+            return d.includes(ref);
+          });
+          if (!match) continue;
+
+          const amountReceived = parseFloat(match.attributes.amount.value);
+          if (amountReceived >= owedTotal - 0.01) {
+            // Full payment — mark everything paid
+            newGifts = newGifts.map(g => {
+              if (!roundGiftIds.includes(g.id)) return g;
+              const nc = g.contributions.map(c => c.memberId === memberId && !c.paid ? { ...c, paid: true, paidAt: match.attributes.createdAt } : c);
+              const allPaid = nc.length > 0 && nc.every(c => c.paid);
+              return { ...g, contributions: nc, status: allPaid ? "complete" : g.status };
+            });
+            updated = true;
+          } else {
+            // Partial / mismatch — flag for admin review, don't auto-mark
+            const alreadyFlagged = newReviewQueue.some(r => r.roundId === round.id && r.memberId === memberId && r.transactionId === match.id);
+            if (!alreadyFlagged) {
+              newReviewQueue.push({
+                id: genId(), roundId: round.id, memberId, transactionId: match.id,
+                amountReceived, amountOwed: owedTotal, flaggedAt: new Date().toISOString(),
+              });
+              updated = true;
+            }
+          }
+        }
+      }
+
+      await save({ ...data, gifts: newGifts, reviewQueue: newReviewQueue });
       setSyncMsg(updated ? "Payments found & updated!" : "No new payments detected");
     } catch { setSyncMsg("Sync failed"); }
     setTimeout(() => setSyncMsg(null), 3000);
   }, [data, save]);
 
-  // Find the current user's member ID based on their name
   const myMemberId = data?.members?.find(m => m.name.toLowerCase() === myName.toLowerCase())?.id || null;
 
   if (loading) return <div className="min-h-screen flex items-center justify-center"><p className="text-brand-muted">Loading…</p></div>;
 
-  // ─── Login screen ───
   if (!authed) return (
     <div className="min-h-screen flex items-center justify-center px-6">
       <div className="fade-up w-full max-w-xs text-center">
@@ -130,7 +194,6 @@ export default function McGift() {
     </div>
   );
 
-  // ─── Name selection (family only) ───
   if (!nameConfirmed) return (
     <div className="min-h-screen flex items-center justify-center px-6">
       <div className="fade-up w-full max-w-xs text-center">
@@ -154,10 +217,20 @@ export default function McGift() {
   const archived = data.gifts.filter(g => g.status === "archived");
   const live = [...active, ...complete];
 
-  // For family view: tabs are Gifts, Wish Lists only (no People, no Settings)
   const tabs = isAdmin
-    ? [{k:"gifts",l:"Gifts",c:live.length},{k:"wishlists",l:"Wish Lists"},{k:"members",l:"People",c:data.members.length},{k:"settings",l:"Settings"}]
+    ? [{k:"gifts",l:"Gifts",c:live.length},{k:"rounds",l:"Rounds",c:data.rounds.length},{k:"review",l:"Review",c:data.reviewQueue.length},{k:"wishlists",l:"Wish Lists"},{k:"members",l:"People",c:data.members.length},{k:"settings",l:"Settings"}]
     : [{k:"gifts",l:"Gifts",c:live.length},{k:"wishlists",l:"Wish Lists"}];
+
+  // Group gifts by round for display
+  const groupedGifts = (giftList) => {
+    const groups = {}; // roundId (or "standalone") -> gifts[]
+    giftList.forEach(g => {
+      const key = g.roundId || "standalone";
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(g);
+    });
+    return groups;
+  };
 
   return (
     <div className="min-h-screen">
@@ -189,7 +262,6 @@ export default function McGift() {
       <main className="max-w-3xl mx-auto px-6 py-5 pb-10">
         {/* ── Gifts ── */}
         {view==="gifts"&&<div className="fade-up">
-          {/* Stats — admin sees totals, family sees their own */}
           {isAdmin ? (
             <div className="flex gap-3 mb-5 flex-wrap">
               <div className="p-3 px-4 bg-brand-accent-light rounded-lg flex-1 min-w-[100px]"><div className="text-[22px] font-bold font-display text-brand-accent">{active.length}</div><div className="text-xs text-brand-accent font-medium">Active</div></div>
@@ -219,54 +291,77 @@ export default function McGift() {
 
           {live.length===0&&<Crd className="text-center !p-12"><div className="text-4xl mb-3">🎁</div><p className="text-brand-muted">{isAdmin ? "No gifts yet. Add people first, then propose a gift." : "No gifts yet."}</p></Crd>}
 
-          {live.map((g,i)=>{
-            const myContrib = g.contributions.find(c => c.memberId === myMemberId);
-            const dl = daysLeft(g.deadline);
-            const gRef = giftRefCode(g.recipient, g.title);
-
-            if (isAdmin) {
-              // Admin sees full details
-              const tp=g.contributions.reduce((s,c)=>s+c.amount,0), pd=g.contributions.filter(c=>c.paid).reduce((s,c)=>s+c.amount,0), pct=tp>0?Math.min(pd/tp*100,100):0;
-              return <Crd key={g.id} className="fade-up mb-3 cursor-pointer" style={{animationDelay:`${i*0.05}s`}}>
-                <div onClick={()=>setSelGift(g)}>
-                  <div className="flex justify-between items-start mb-2">
-                    <div><h3 className="font-display text-lg font-bold mb-0.5">{g.title}</h3><p className="text-[13px] text-brand-muted">For {g.recipient} · {gRef}{g.deadline&&<span> · Due {fmtDate(g.deadline)}</span>}</p></div>
-                    <div className="flex gap-1.5 flex-wrap justify-end">{dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}{dl!==null&&dl<=0&&g.status==="active"&&<Bdg v="warning">Overdue</Bdg>}<Bdg v={g.status==="complete"?"success":"default"}>{g.status==="complete"?"✓ All Paid":"Active"}</Bdg></div>
+          {/* Admin: flat list grouped by round header (informational) */}
+          {isAdmin && Object.entries(groupedGifts(live)).map(([key, gifts]) => {
+            const round = key !== "standalone" ? data.rounds.find(r => r.id === key) : null;
+            return <div key={key} className="mb-4">
+              {round && <div className="text-[13px] font-semibold text-brand-muted uppercase tracking-wider mb-2 mt-4">{round.name} · {round.refCode}</div>}
+              {gifts.map((g,i)=>{
+                const tp=g.contributions.reduce((s,c)=>s+c.amount,0), pd=g.contributions.filter(c=>c.paid).reduce((s,c)=>s+c.amount,0), pct=tp>0?Math.min(pd/tp*100,100):0;
+                const dl = daysLeft(g.deadline);
+                const gRef = g.roundId ? round?.refCode : giftRefCode(g.recipient);
+                return <Crd key={g.id} className="fade-up mb-3 cursor-pointer" style={{animationDelay:`${i*0.05}s`}}>
+                  <div onClick={()=>setSelGift(g)}>
+                    <div className="flex justify-between items-start mb-2">
+                      <div><h3 className="font-display text-lg font-bold mb-0.5">{g.title}</h3><p className="text-[13px] text-brand-muted">For {g.recipient} · {gRef}{g.deadline&&<span> · Due {fmtDate(g.deadline)}</span>}</p></div>
+                      <div className="flex gap-1.5 flex-wrap justify-end">{dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}{dl!==null&&dl<=0&&g.status==="active"&&<Bdg v="warning">Overdue</Bdg>}<Bdg v={g.status==="complete"?"success":"default"}>{g.status==="complete"?"✓ All Paid":"Active"}</Bdg></div>
+                    </div>
+                    {g.description&&<p className="text-sm text-brand-muted mb-3">{g.description}</p>}
+                    <div className="flex items-center gap-3"><div className="flex-1 h-1.5 bg-brand-border rounded-full overflow-hidden"><div className="h-full rounded-full transition-all duration-500" style={{width:`${pct}%`,background:g.status==="complete"?G:A}}/></div><span className="text-[13px] font-semibold whitespace-nowrap">${pd.toFixed(0)} / ${tp.toFixed(0)} pledged</span></div>
+                    <div className="mt-2.5 flex gap-1.5 flex-wrap">{g.contributions.map(c=>{const m=data.members.find(x=>x.id===c.memberId);return<span key={c.id} className={`text-xs px-2.5 py-0.5 rounded-xl font-medium ${c.paid?"bg-brand-green-light text-brand-green":"bg-[#F0ECE4] text-brand-muted"}`}>{m?.name||"?"} · ${c.amount}{c.paid?" ✓":""}</span>})}</div>
                   </div>
-                  {g.description&&<p className="text-sm text-brand-muted mb-3">{g.description}</p>}
-                  <div className="flex items-center gap-3"><div className="flex-1 h-1.5 bg-brand-border rounded-full overflow-hidden"><div className="h-full rounded-full transition-all duration-500" style={{width:`${pct}%`,background:g.status==="complete"?G:A}}/></div><span className="text-[13px] font-semibold whitespace-nowrap">${pd.toFixed(0)} / ${tp.toFixed(0)} pledged</span></div>
-                  <div className="mt-2.5 flex gap-1.5 flex-wrap">{g.contributions.map(c=>{const m=data.members.find(x=>x.id===c.memberId);return<span key={c.id} className={`text-xs px-2.5 py-0.5 rounded-xl font-medium ${c.paid?"bg-brand-green-light text-brand-green":"bg-[#F0ECE4] text-brand-muted"}`}>{m?.name||"?"} · ${c.amount}{c.paid?" ✓":""}</span>})}</div>
-                </div>
-              </Crd>;
-            }
-
-            // Family view — shows all active gifts, with opt-in or their own details
-            return <FamilyGiftCard key={g.id} gift={g} myContrib={myContrib} myMemberId={myMemberId} myName={myName} dl={dl}
-              onOptIn={(amount) => {
-                const ref = genRef(g.recipient, g.title, myName);
-                const newC = {id:genId(), memberId:myMemberId, amount, paid:false, paidAt:null, refCode:ref};
-                const newGifts = data.gifts.map(x => x.id===g.id ? {...x, contributions:[...x.contributions, newC]} : x);
-                save({...data, gifts:newGifts});
-              }}
-              onEdit={(newAmount) => {
-                const newGifts = data.gifts.map(x => {
-                  if (x.id !== g.id) return x;
-                  return {...x, contributions: x.contributions.map(c => c.memberId === myMemberId ? {...c, amount: newAmount} : c)};
-                });
-                save({...data, gifts:newGifts});
-              }}
-              onWithdraw={() => {
-                const newGifts = data.gifts.map(x => {
-                  if (x.id !== g.id) return x;
-                  return {...x, contributions: x.contributions.filter(c => c.memberId !== myMemberId)};
-                });
-                save({...data, gifts:newGifts});
-              }}
-              i={i}
-            />;
+                </Crd>;
+              })}
+            </div>;
           })}
 
-          {/* Admin: archived section */}
+          {/* Family: grouped by round with running total + shared ref code */}
+          {!isAdmin && Object.entries(groupedGifts(active.filter(g => g.recipient.toLowerCase() !== myName.toLowerCase()))).map(([key, gifts]) => {
+            const round = key !== "standalone" ? data.rounds.find(r => r.id === key) : null;
+            const myTotal = gifts.reduce((s,g) => s + g.contributions.filter(c=>c.memberId===myMemberId&&!c.paid).reduce((ss,c)=>ss+c.amount,0), 0);
+            const myRef = round ? roundPersonRef(round, myName) : null;
+            return <div key={key} className="mb-6">
+              {round && myTotal > 0 && (
+                <Crd className="mb-3 bg-[#FFFBF5] border-dashed border-brand-accent">
+                  <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">{round.name} — You Owe</div>
+                  <div className="text-2xl font-bold font-display text-brand-accent mb-2">${myTotal.toFixed(0)}</div>
+                  {process.env.NEXT_PUBLIC_PAYID&&<div className="text-sm"><span className="text-brand-muted">PayID: </span><span className="font-semibold">{process.env.NEXT_PUBLIC_PAYID}</span></div>}
+                  <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Your Reference (use for all gifts below)</div>
+                  <div className="text-xl font-bold font-mono tracking-wider">{myRef}</div>
+                  <div className="text-xs text-brand-muted mt-1">One transfer covers everything in this round</div>
+                </Crd>
+              )}
+              {round && <div className="text-[13px] font-semibold text-brand-muted uppercase tracking-wider mb-2">{round.name}</div>}
+              {gifts.map((g,i)=>{
+                const myContrib = g.contributions.find(c => c.memberId === myMemberId);
+                const dl = daysLeft(g.deadline);
+                return <FamilyGiftCard key={g.id} gift={g} myContrib={myContrib} myMemberId={myMemberId} myName={myName} dl={dl} inRound={!!round}
+                  onOptIn={(amount) => {
+                    const ref = round ? roundPersonRef(round, myName) : genRef(g.recipient, myName);
+                    const newC = {id:genId(), memberId:myMemberId, amount, paid:false, paidAt:null, refCode:ref};
+                    const newGifts = data.gifts.map(x => x.id===g.id ? {...x, contributions:[...x.contributions, newC]} : x);
+                    save({...data, gifts:newGifts});
+                  }}
+                  onEdit={(newAmount) => {
+                    const newGifts = data.gifts.map(x => {
+                      if (x.id !== g.id) return x;
+                      return {...x, contributions: x.contributions.map(c => c.memberId === myMemberId ? {...c, amount: newAmount} : c)};
+                    });
+                    save({...data, gifts:newGifts});
+                  }}
+                  onWithdraw={() => {
+                    const newGifts = data.gifts.map(x => {
+                      if (x.id !== g.id) return x;
+                      return {...x, contributions: x.contributions.filter(c => c.memberId !== myMemberId)};
+                    });
+                    save({...data, gifts:newGifts});
+                  }}
+                  i={i}
+                />;
+              })}
+            </div>;
+          })}
+
           {isAdmin && archived.length>0&&<div className="mt-6">
             <button onClick={()=>setShowArch(!showArch)} className="text-[13px] font-semibold text-brand-muted flex items-center gap-1.5 py-2 cursor-pointer bg-transparent border-none"><span className={`inline-block transition-transform ${showArch?"rotate-90":""}`}>▸</span>Archived ({archived.length})</button>
             {showArch&&archived.map((g,i)=><Crd key={g.id} className="fade-up mb-3 opacity-70" style={{animationDelay:`${i*0.05}s`}}>
@@ -274,6 +369,58 @@ export default function McGift() {
               <div className="flex gap-2 items-center"><Bdg v="archived">Archived</Bdg><button onClick={()=>save({...data,gifts:data.gifts.map(x=>x.id===g.id?{...x,status:"active"}:x)})} className="text-xs text-brand-accent font-semibold cursor-pointer bg-transparent border-none">Reopen</button></div></div>
             </Crd>)}
           </div>}
+        </div>}
+
+        {/* ── Rounds (admin only) ── */}
+        {view==="rounds"&&isAdmin&&<div className="fade-up">
+          <Btn onClick={()=>setShowNewRound(true)} style={{marginBottom:"16px"}}>+ New Round</Btn>
+          {data.rounds.length===0&&<Crd className="text-center !p-12"><div className="text-4xl mb-3">📅</div><p className="text-brand-muted">No rounds yet. Create one to group gifts together (e.g. "July Get-Together").</p></Crd>}
+          <div className="grid gap-3">{data.rounds.map((r,i)=>{
+            const roundGifts = data.gifts.filter(g=>g.roundId===r.id);
+            const total = roundGifts.reduce((s,g)=>s+g.contributions.reduce((ss,c)=>ss+c.amount,0),0);
+            return <Crd key={r.id} className="fade-up" style={{animationDelay:`${i*0.05}s`}}>
+              <div className="flex justify-between items-start">
+                <div>
+                  <h3 className="font-display text-lg font-bold mb-0.5">{r.name}</h3>
+                  <p className="text-[13px] text-brand-muted">Code: {r.refCode} · {roundGifts.length} gifts · ${total.toFixed(0)} pledged</p>
+                </div>
+                <div className="flex gap-2 items-center">
+                  <Bdg v={r.status==="open"?"default":"muted"}>{r.status==="open"?"Open":"Closed"}</Bdg>
+                  <button onClick={()=>save({...data,rounds:data.rounds.map(x=>x.id===r.id?{...x,status:x.status==="open"?"closed":"open"}:x)})} className="text-xs text-brand-accent font-semibold cursor-pointer bg-transparent border-none">
+                    {r.status==="open"?"Close":"Reopen"}
+                  </button>
+                </div>
+              </div>
+            </Crd>;
+          })}</div>
+        </div>}
+
+        {/* ── Review Queue (admin only) ── */}
+        {view==="review"&&isAdmin&&<div className="fade-up">
+          <p className="text-sm text-brand-muted mb-4">Transfers that came in but didn't exactly match what was owed — review and resolve manually.</p>
+          {data.reviewQueue.length===0&&<Crd className="text-center !p-12"><div className="text-4xl mb-3">✅</div><p className="text-brand-muted">Nothing to review right now.</p></Crd>}
+          <div className="grid gap-3">{data.reviewQueue.map((item,i)=>{
+            const member = data.members.find(m=>m.id===item.memberId);
+            const round = data.rounds.find(r=>r.id===item.roundId);
+            return <Crd key={item.id} className="fade-up" style={{animationDelay:`${i*0.05}s`}}>
+              <h3 className="font-display text-base font-bold mb-1">{member?.name||"?"} · {round?.name||"?"}</h3>
+              <p className="text-sm text-brand-muted mb-3">Received <strong className="text-brand-text">${item.amountReceived.toFixed(2)}</strong> but owed <strong className="text-brand-text">${item.amountOwed.toFixed(2)}</strong></p>
+              <div className="flex gap-2">
+                <Btn sm onClick={()=>{
+                  // Mark all their unpaid contributions in this round as paid manually
+                  const roundGiftIds = data.gifts.filter(g=>g.roundId===item.roundId).map(g=>g.id);
+                  const newGifts = data.gifts.map(g=>{
+                    if(!roundGiftIds.includes(g.id)) return g;
+                    const nc = g.contributions.map(c=>c.memberId===item.memberId&&!c.paid?{...c,paid:true,paidAt:new Date().toISOString()}:c);
+                    const allPaid = nc.length>0&&nc.every(c=>c.paid);
+                    return {...g,contributions:nc,status:allPaid?"complete":g.status};
+                  });
+                  save({...data,gifts:newGifts,reviewQueue:data.reviewQueue.filter(x=>x.id!==item.id)});
+                }}>Mark all paid</Btn>
+                <Btn sm v="ghost" onClick={()=>save({...data,reviewQueue:data.reviewQueue.filter(x=>x.id!==item.id)})}>Dismiss</Btn>
+              </div>
+            </Crd>;
+          })}</div>
         </div>}
 
         {/* ── Wish Lists ── */}
@@ -304,12 +451,12 @@ export default function McGift() {
             </div>
           </Crd>
           <Crd><h3 className="font-display text-lg font-bold mb-1">How It Works</h3><div className="text-sm text-brand-muted leading-7">
-            <p className="mb-2">1. Add family in the <strong>People</strong> tab.</p>
-            <p className="mb-2">2. Add gift ideas to <strong>Wish Lists</strong>.</p>
-            <p className="mb-2">3. Create a gift with a deadline.</p>
-            <p className="mb-2">4. Each person gets a unique reference code like <strong>DAD-FDAY26-MOL</strong>.</p>
-            <p className="mb-2">5. Contributors include their reference code in the bank transfer.</p>
-            <p className="mb-2">6. Hit <strong>Sync</strong> — auto-matches Up Bank payments.</p>
+            <p className="mb-2">1. Create a <strong>Round</strong> for grouped events (e.g. "July Get-Together"), or leave gifts standalone for one-offs.</p>
+            <p className="mb-2">2. Add family in the <strong>People</strong> tab.</p>
+            <p className="mb-2">3. Create gifts and assign them to a round.</p>
+            <p className="mb-2">4. Family opt in per gift with their own amount — private to them.</p>
+            <p className="mb-2">5. Each person gets <strong>one reference code per round</strong> — one transfer covers everything they've opted into in that round.</p>
+            <p className="mb-2">6. Hit <strong>Sync</strong> — matches transfers automatically. Mismatches land in <strong>Review</strong>.</p>
             <p>7. <strong>Archive</strong> gifts when done.</p>
           </div></Crd>
         </div>}
@@ -318,13 +465,16 @@ export default function McGift() {
       {/* Modals (admin only) */}
       {isAdmin && <>
         <Mdl open={showNewGift} onClose={()=>setShowNewGift(false)} title="New Gift">
-          <GiftForm members={data.members} onSave={g=>{save({...data,gifts:[g,...data.gifts]});setShowNewGift(false)}} />
+          <GiftForm members={data.members} rounds={data.rounds.filter(r=>r.status==="open")} onSave={g=>{save({...data,gifts:[g,...data.gifts]});setShowNewGift(false)}} />
         </Mdl>
         <Mdl open={showNewMember} onClose={()=>setShowNewMember(false)} title="Add Person">
           <MemberForm onSave={m=>{save({...data,members:[...data.members,m]});setShowNewMember(false)}} />
         </Mdl>
+        <Mdl open={showNewRound} onClose={()=>setShowNewRound(false)} title="New Round">
+          <RoundForm onSave={r=>{save({...data,rounds:[...data.rounds,r]});setShowNewRound(false)}} />
+        </Mdl>
         <Mdl open={!!selGift} onClose={()=>setSelGift(null)} title={selGift?.title||""}>
-          {selGift&&<GiftDetail gift={selGift} members={data.members}
+          {selGift&&<GiftDetail gift={selGift} members={data.members} round={data.rounds.find(r=>r.id===selGift.roundId)}
             onUpdate={g=>{const ng=data.gifts.map(x=>x.id===g.id?g:x);save({...data,gifts:ng});setSelGift(g)}}
             onDelete={()=>{save({...data,gifts:data.gifts.filter(g=>g.id!==selGift.id)});setSelGift(null)}}
             onArchive={()=>{save({...data,gifts:data.gifts.map(g=>g.id===selGift.id?{...g,status:"archived"}:g)});setSelGift(null)}}
@@ -335,17 +485,36 @@ export default function McGift() {
   );
 }
 
+// ─── Round Form ───
+function RoundForm({ onSave }) {
+  const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  return <div className="flex flex-col gap-4">
+    <Inp label="Round Name" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. July Get-Together" />
+    <Inp label="Short Code (for reference codes)" value={code} onChange={e=>setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,""))} placeholder="e.g. JULY26" />
+    <p className="text-xs text-brand-muted -mt-2">Keep it short — this becomes part of everyone's transfer reference.</p>
+    <Btn onClick={()=>{if(name&&code)onSave({id:genId(),name,refCode:code,status:"open",createdAt:new Date().toISOString()})}} disabled={!name||!code}>Create Round</Btn>
+  </div>;
+}
+
 // ─── Gift Form (admin) ───
-function GiftForm({ members, onSave }) {
-  const [title,setTitle]=useState(""), [recip,setRecip]=useState(""), [desc,setDesc]=useState(""), [deadline,setDl]=useState(""), [sel,setSel]=useState({});
+function GiftForm({ members, rounds, onSave }) {
+  const [title,setTitle]=useState(""), [recip,setRecip]=useState(""), [desc,setDesc]=useState(""), [deadline,setDl]=useState(""), [roundId,setRoundId]=useState(""), [sel,setSel]=useState({});
   const tp = Object.values(sel).reduce((s,v)=>s+(parseFloat(v)||0),0);
   return <div className="flex flex-col gap-4">
     <Inp label="Gift Title" value={title} onChange={e=>setTitle(e.target.value)} placeholder="e.g. Fathers Day" />
     <Inp label="For Who" value={recip} onChange={e=>setRecip(e.target.value)} placeholder="e.g. Dad" />
     <Inp label="Description (optional)" value={desc} onChange={e=>setDesc(e.target.value)} placeholder="e.g. Weber BBQ from Bunnings" />
     <Inp label="Deadline" type="date" value={deadline} onChange={e=>setDl(e.target.value)} />
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-semibold text-brand-muted uppercase tracking-wider">Round (optional)</label>
+      <select value={roundId} onChange={e=>setRoundId(e.target.value)} className="px-3.5 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white">
+        <option value="">No round — standalone gift</option>
+        {rounds.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}
+      </select>
+    </div>
     {members.length>0&&<div>
-      <label className="text-xs font-semibold text-brand-muted uppercase tracking-wider mb-2 block">Who's In?</label>
+      <label className="text-xs font-semibold text-brand-muted uppercase tracking-wider mb-2 block">Who's In? (optional — or let people opt themselves in)</label>
       <div className="flex flex-col gap-2">{members.map(m=><div key={m.id} className="flex items-center gap-2.5">
         <span className="text-sm font-medium w-24 truncate">{m.name}</span>
         <input type="number" placeholder="$0" value={sel[m.id]||""} onChange={e=>setSel({...sel,[m.id]:e.target.value})} className="flex-1 px-3 py-2 border-[1.5px] border-brand-border rounded-lg text-sm outline-none bg-white" />
@@ -354,11 +523,13 @@ function GiftForm({ members, onSave }) {
     </div>}
     <Btn onClick={()=>{
       if(!title||!recip) return;
+      const round = rounds.find(r=>r.id===roundId);
       const cs = Object.entries(sel).filter(([,v])=>v>0).map(([memberId,amount])=>{
         const member = members.find(m=>m.id===memberId);
-        return {id:genId(), memberId, amount:parseFloat(amount), paid:false, paidAt:null, refCode: genRef(recip, title, member?.name)};
+        const ref = round ? roundPersonRef(round, member?.name) : genRef(recip, member?.name);
+        return {id:genId(), memberId, amount:parseFloat(amount), paid:false, paidAt:null, refCode: ref};
       });
-      onSave({id:genId(), title, recipient:recip, description:desc, deadline:deadline||null, refCode: giftRefCode(recip, title), contributions:cs, status:"active", createdAt:new Date().toISOString()});
+      onSave({id:genId(), title, recipient:recip, description:desc, deadline:deadline||null, roundId:roundId||null, refCode: giftRefCode(recip), contributions:cs, status:"active", createdAt:new Date().toISOString()});
     }} disabled={!title||!recip}>Create Gift</Btn>
   </div>;
 }
@@ -375,12 +546,12 @@ function MemberForm({ onSave }) {
 }
 
 // ─── Gift Detail (admin only) ───
-function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
+function GiftDetail({ gift, members, round, onUpdate, onDelete, onArchive }) {
   const [adding,setAdding]=useState(null), [amt,setAmt]=useState("");
   const cs=gift.contributions, eIds=cs.map(c=>c.memberId), avail=members.filter(m=>!eIds.includes(m.id));
   const pd=cs.filter(c=>c.paid).reduce((s,c)=>s+c.amount,0), tp=cs.reduce((s,c)=>s+c.amount,0), dl=daysLeft(gift.deadline);
   return <div>
-    <p className="text-sm text-brand-muted mb-1">For <strong>{gift.recipient}</strong></p>
+    <p className="text-sm text-brand-muted mb-1">For <strong>{gift.recipient}</strong>{round && <span> · Round: {round.name}</span>}</p>
     {gift.description&&<p className="text-sm text-brand-muted mb-1">{gift.description}</p>}
     {gift.deadline&&<p className={`text-[13px] mb-3 ${dl!==null&&dl<=3?"text-brand-yellow font-semibold":"text-brand-muted"}`}>Deadline: {fmtDate(gift.deadline)}{dl!==null&&dl>0&&` (${dl} days left)`}{dl!==null&&dl<=0&&" (overdue)"}</p>}
     <div className="flex gap-3 mb-4">
@@ -388,9 +559,9 @@ function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
       <div className="p-2.5 px-4 bg-[#F0ECE4] rounded-lg flex-1"><div className="text-lg font-bold font-display text-brand-muted">${tp.toFixed(0)}</div><div className="text-[11px] text-brand-muted">Pledged</div></div>
     </div>
     <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg mb-5">
-      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">Pay ID</div>
+      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mb-0.5">PayID</div>
       {process.env.NEXT_PUBLIC_PAYID&&<div className="text-sm font-semibold mt-1">{process.env.NEXT_PUBLIC_PAYID}</div>}
-      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-1">Reference Codes</div>
+      <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-1">Reference Codes {round && "(shared across this round)"}</div>
       {cs.map(c => {
         const m = members.find(x => x.id === c.memberId);
         return <div key={c.id} className="flex justify-between items-center py-1">
@@ -411,7 +582,8 @@ function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
         <input type="number" placeholder="$0" value={amt} onChange={e=>setAmt(e.target.value)} className="w-20 px-3 py-2 border-[1.5px] border-brand-border rounded-lg text-sm" />
         <Btn sm onClick={()=>{if(adding&&amt){
           const member = avail.find(m=>m.id===adding);
-          onUpdate({...gift,contributions:[...cs,{id:genId(),memberId:adding,amount:parseFloat(amt),paid:false,paidAt:null,refCode:genRef(gift.recipient,gift.title,member?.name)}]});
+          const ref = round ? roundPersonRef(round, member?.name) : genRef(gift.recipient, member?.name);
+          onUpdate({...gift,contributions:[...cs,{id:genId(),memberId:adding,amount:parseFloat(amt),paid:false,paidAt:null,refCode:ref}]});
           setAdding(null);setAmt("")}}}>Add</Btn>
         <Btn sm v="ghost" onClick={()=>{setAdding(null);setAmt("")}}>Cancel</Btn>
       </div>}
@@ -421,6 +593,90 @@ function GiftDetail({ gift, members, onUpdate, onDelete, onArchive }) {
       <Btn v="ghost" sm onClick={()=>{if(confirm("Delete permanently?"))onDelete()}} style={{color:"#c0392b"}}>Delete</Btn>
     </div>
   </div>;
+}
+
+// ─── Family Gift Card ───
+function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, inRound, onOptIn, onEdit, onWithdraw, i }) {
+  const [showOptIn, setShowOptIn] = useState(false);
+  const [optAmt, setOptAmt] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editAmt, setEditAmt] = useState("");
+
+  return <Crd className="fade-up mb-3" style={{animationDelay:`${i*0.05}s`}}>
+    <div className="flex justify-between items-start mb-2">
+      <div>
+        <h3 className="font-display text-lg font-bold mb-0.5">{gift.title}</h3>
+        <p className="text-[13px] text-brand-muted">For {gift.recipient}{gift.deadline&&<span> · Due {fmtDate(gift.deadline)}</span>}</p>
+      </div>
+      <div className="flex gap-1.5 flex-wrap justify-end">
+        {dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}
+        {dl!==null&&dl<=0&&gift.status==="active"&&<Bdg v="warning">Overdue</Bdg>}
+        {myContrib ? (myContrib.paid ? <Bdg v="success">Paid ✓</Bdg> : <Bdg v="default">Pending</Bdg>) : <Bdg v="muted">Not joined</Bdg>}
+      </div>
+    </div>
+    {gift.description&&<p className="text-sm text-brand-muted mb-3">{gift.description}</p>}
+
+    {!myContrib && gift.status === "active" && (
+      showOptIn ? (
+        <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
+          <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">How much will you contribute?</label>
+          <div className="flex gap-2 items-end">
+            <div className="flex-1">
+              <input type="number" placeholder="$0" value={optAmt} onChange={e=>setOptAmt(e.target.value)}
+                className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
+            </div>
+            <Btn onClick={()=>{if(optAmt&&parseFloat(optAmt)>0){onOptIn(parseFloat(optAmt));setShowOptIn(false);setOptAmt("")}}} disabled={!optAmt||parseFloat(optAmt)<=0}>Confirm</Btn>
+            <Btn v="ghost" onClick={()=>{setShowOptIn(false);setOptAmt("")}}>Cancel</Btn>
+          </div>
+        </div>
+      ) : (
+        <Btn v="secondary" onClick={()=>setShowOptIn(true)}>I'm in!</Btn>
+      )
+    )}
+
+    {myContrib && !myContrib.paid && (
+      <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
+        {editing ? (
+          <>
+            <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">Update your amount</label>
+            <div className="flex gap-2 items-end mb-1">
+              <div className="flex-1">
+                <input type="number" placeholder="$0" value={editAmt} onChange={e=>setEditAmt(e.target.value)}
+                  className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
+              </div>
+              <Btn onClick={()=>{if(editAmt&&parseFloat(editAmt)>0){onEdit(parseFloat(editAmt));setEditing(false);setEditAmt("")}}} disabled={!editAmt||parseFloat(editAmt)<=0}>Save</Btn>
+              <Btn v="ghost" onClick={()=>{setEditing(false);setEditAmt("")}}>Cancel</Btn>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex justify-between items-center">
+              <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
+              <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
+            </div>
+            {!inRound && (
+              <>
+                {process.env.NEXT_PUBLIC_PAYID&&<div className="text-sm mt-2"><span className="text-brand-muted">PayID: </span><span className="font-semibold">{process.env.NEXT_PUBLIC_PAYID}</span></div>}
+                <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Your Reference</div>
+                <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
+              </>
+            )}
+            {inRound && <p className="text-xs text-brand-muted mt-2">Use the round reference shown above to pay this along with your other gifts.</p>}
+            <div className="flex gap-3 mt-3 pt-3 border-t border-brand-border">
+              <button onClick={()=>{setEditing(true);setEditAmt(myContrib.amount.toString())}} className="text-xs text-brand-accent font-semibold cursor-pointer bg-transparent border-none">Change amount</button>
+              <button onClick={()=>{if(confirm("Withdraw from this gift?"))onWithdraw()}} className="text-xs text-brand-muted cursor-pointer bg-transparent border-none">Withdraw</button>
+            </div>
+          </>
+        )}
+      </div>
+    )}
+
+    {myContrib && myContrib.paid && (
+      <div className="p-3 px-4 bg-brand-green-light rounded-lg text-center">
+        <span className="text-sm font-semibold text-brand-green">You've paid ${myContrib.amount.toFixed(0)} ✓</span>
+      </div>
+    )}
+  </Crd>;
 }
 
 // ─── Wish Lists ───
@@ -445,89 +701,4 @@ function WishTab({ wishlists, onSave }) {
         <button onClick={()=>setAddTo(n)} className="mt-2 text-[13px] text-brand-accent font-semibold cursor-pointer py-1 bg-transparent border-none">+ Add another idea</button>}
     </Crd>})}
   </div>;
-}
-
-// ─── Family Gift Card (contributor view) ───
-function FamilyGiftCard({ gift, myContrib, myMemberId, myName, dl, onOptIn, onEdit, onWithdraw, i }) {
-  const [showOptIn, setShowOptIn] = useState(false);
-  const [optAmt, setOptAmt] = useState("");
-  const [editing, setEditing] = useState(false);
-  const [editAmt, setEditAmt] = useState("");
-
-  // Don't show gifts where this person is the recipient
-  if (gift.recipient.toLowerCase() === myName.toLowerCase()) return null;
-
-  return <Crd className="fade-up mb-3" style={{animationDelay:`${i*0.05}s`}}>
-    <div className="flex justify-between items-start mb-2">
-      <div>
-        <h3 className="font-display text-lg font-bold mb-0.5">{gift.title}</h3>
-        <p className="text-[13px] text-brand-muted">For {gift.recipient}{gift.deadline&&<span> · Due {fmtDate(gift.deadline)}</span>}</p>
-      </div>
-      <div className="flex gap-1.5 flex-wrap justify-end">
-        {dl!==null&&dl<=7&&dl>0&&<Bdg v="warning">{dl}d left</Bdg>}
-        {dl!==null&&dl<=0&&gift.status==="active"&&<Bdg v="warning">Overdue</Bdg>}
-        {myContrib ? (myContrib.paid ? <Bdg v="success">Paid ✓</Bdg> : <Bdg v="default">Pending</Bdg>) : <Bdg v="muted">Not joined</Bdg>}
-      </div>
-    </div>
-    {gift.description&&<p className="text-sm text-brand-muted mb-3">{gift.description}</p>}
-
-    {/* Not yet opted in */}
-    {!myContrib && gift.status === "active" && (
-      showOptIn ? (
-        <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
-          <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">How much will you contribute?</label>
-          <div className="flex gap-2 items-end">
-            <div className="flex-1">
-              <input type="number" placeholder="$0" value={optAmt} onChange={e=>setOptAmt(e.target.value)}
-                className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
-            </div>
-            <Btn onClick={()=>{if(optAmt&&parseFloat(optAmt)>0){onOptIn(parseFloat(optAmt));setShowOptIn(false);setOptAmt("")}}} disabled={!optAmt||parseFloat(optAmt)<=0}>Confirm</Btn>
-            <Btn v="ghost" onClick={()=>{setShowOptIn(false);setOptAmt("")}}>Cancel</Btn>
-          </div>
-        </div>
-      ) : (
-        <Btn v="secondary" onClick={()=>setShowOptIn(true)}>I'm in!</Btn>
-      )
-    )}
-
-    {/* Opted in but not paid */}
-    {myContrib && !myContrib.paid && (
-      <div className="p-3 px-4 bg-[#FFFBF5] border border-dashed border-brand-accent rounded-lg">
-        {editing ? (
-          <>
-            <label className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest block mb-2">Update your amount</label>
-            <div className="flex gap-2 items-end mb-3">
-              <div className="flex-1">
-                <input type="number" placeholder="$0" value={editAmt} onChange={e=>setEditAmt(e.target.value)}
-                  className="w-full px-3 py-2.5 border-[1.5px] border-brand-border rounded-lg text-[15px] outline-none bg-white focus:border-brand-accent" />
-              </div>
-              <Btn onClick={()=>{if(editAmt&&parseFloat(editAmt)>0){onEdit(parseFloat(editAmt));setEditing(false);setEditAmt("")}}} disabled={!editAmt||parseFloat(editAmt)<=0}>Save</Btn>
-              <Btn v="ghost" onClick={()=>{setEditing(false);setEditAmt("")}}>Cancel</Btn>
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="flex justify-between items-center mb-2">
-              <span className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest">Your Contribution</span>
-              <span className="text-lg font-bold font-display text-brand-accent">${myContrib.amount.toFixed(0)}</span>
-            </div>
-            {process.env.NEXT_PUBLIC_PAYID&&<><div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-2 mb-0.5">Pay ID</div><div className="text-sm font-semibold">{process.env.NEXT_PUBLIC_PAYID}</div></>}
-            <div className="text-[11px] font-semibold text-brand-accent uppercase tracking-widest mt-3 mb-0.5">Your Reference</div>
-            <div className="text-xl font-bold font-mono tracking-wider">{myContrib.refCode || "—"}</div>
-            <div className="flex gap-3 mt-3 pt-3 border-t border-brand-border">
-              <button onClick={()=>{setEditing(true);setEditAmt(myContrib.amount.toString())}} className="text-xs text-brand-accent font-semibold cursor-pointer bg-transparent border-none">Change amount</button>
-              <button onClick={()=>{if(confirm("Withdraw from this gift?"))onWithdraw()}} className="text-xs text-brand-muted cursor-pointer bg-transparent border-none">Withdraw</button>
-            </div>
-          </>
-        )}
-      </div>
-    )}
-
-    {/* Paid */}
-    {myContrib && myContrib.paid && (
-      <div className="p-3 px-4 bg-brand-green-light rounded-lg text-center">
-        <span className="text-sm font-semibold text-brand-green">You've paid ${myContrib.amount.toFixed(0)} ✓</span>
-      </div>
-    )}
-  </Crd>;
 }
